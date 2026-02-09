@@ -14,8 +14,8 @@ services:
     
     # Device access for serial ports (Linux)
     # Uncomment and adjust if using serial connection
-    # devices:
-    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
     
     # Network mode for host access (needed for BLE and some serial setups)
     # Uncomment if you need host network access
@@ -41,8 +41,8 @@ services:
     
     # Port mappings (if web viewer is enabled)
     # Uncomment and adjust if using web viewer
-    # ports:
-    #   - "8080:8080"
+    ports:
+      - "8080:8080"
     
     # Logging configuration
     logging:
