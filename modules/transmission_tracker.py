@@ -175,6 +175,17 @@ class TransmissionTracker:
         
         return False
     
+    def has_repeater_echo(self, record: TransmissionRecord) -> bool:
+        """Check if a transmission has been echoed by at least one repeater.
+
+        Args:
+            record: The TransmissionRecord to check.
+
+        Returns:
+            True if repeat_count >= 1, False otherwise.
+        """
+        return record.repeat_count >= 1
+
     def _update_command_in_database(self, record: TransmissionRecord):
         """Update command entry in database with latest repeat information"""
         try:

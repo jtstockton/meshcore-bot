@@ -352,6 +352,10 @@ class MeshCoreBot:
                 self.command_manager.custom_syntax = self.command_manager.load_custom_syntax()
                 self.command_manager.banned_users = self.command_manager.load_banned_users()
                 self.command_manager.monitor_channels = self.command_manager.load_monitor_channels()
+                # Update channel retry settings
+                self.command_manager.channel_retry_enabled = self.config.getboolean('Bot', 'channel_retry_enabled', fallback=False)
+                self.command_manager.channel_retry_max_attempts = self.config.getint('Bot', 'channel_retry_max_attempts', fallback=1)
+                self.command_manager.channel_retry_echo_window = self.config.getfloat('Bot', 'channel_retry_echo_window', fallback=10.0)
                 self.logger.info("Command manager config reloaded")
             
             # Update scheduler (scheduled messages)
@@ -461,6 +465,14 @@ dm_max_flood_attempts = 2
 
 # Number of attempts before switching to flood mode
 dm_flood_after = 2
+
+# Channel message retry settings (repeater echo verification)
+# Retry channel messages if no repeater echo is detected within the window
+channel_retry_enabled = false
+# Maximum retry attempts (message sent at most 1 + this many times)
+channel_retry_max_attempts = 1
+# Seconds to wait for repeater echo before retrying
+channel_retry_echo_window = 10
 
 # Timezone for bot operations
 # Use standard timezone names (e.g., "America/New_York", "Europe/London", "UTC")

@@ -99,6 +99,11 @@ class CommandManager:
         self._command_queue: Dict[Tuple[str, str], QueuedCommand] = {}
         self._queue_processor_task: Optional[asyncio.Task] = None
         
+        # Channel retry configuration (repeater echo verification)
+        self.channel_retry_enabled = bot.config.getboolean('Bot', 'channel_retry_enabled', fallback=False)
+        self.channel_retry_max_attempts = bot.config.getint('Bot', 'channel_retry_max_attempts', fallback=1)
+        self.channel_retry_echo_window = bot.config.getfloat('Bot', 'channel_retry_echo_window', fallback=10.0)
+
         self.logger.info(f"CommandManager initialized with {len(self.commands)} plugins")
     
     def _should_queue_command(self, command: BaseCommand, message: MeshMessage) -> Tuple[bool, float]:
@@ -680,44 +685,75 @@ class CommandManager:
     
     async def send_channel_message(self, channel: str, content: str, command_id: Optional[str] = None, skip_user_rate_limit: bool = False) -> bool:
         """Send a channel message using meshcore-cli command.
-        
+
         Resolves channel names to numbers and handles rate limiting.
-        
+        If channel retry is enabled, spawns a background task to verify
+        the message was echoed by a repeater and retries if not.
+
         Args:
             channel: The channel name (e.g., "LongFast").
             content: The message content to send.
             command_id: Optional command_id for repeat tracking (if not provided, one will be generated).
-            
+            skip_user_rate_limit: If True, skip the user rate limiter check.
+
         Returns:
             bool: True if sent successfully, False otherwise.
         """
+        success, tx_record = await self._send_channel_message_internal(
+            channel, content, command_id, skip_user_rate_limit
+        )
+
+        # Spawn echo verification/retry if enabled and send succeeded
+        if success and self.channel_retry_enabled and tx_record:
+            asyncio.create_task(
+                self._check_channel_echo_and_retry(
+                    channel, content, command_id, tx_record, attempt=0
+                )
+            )
+
+        return success
+
+    async def _send_channel_message_internal(self, channel: str, content: str, command_id: Optional[str] = None, skip_user_rate_limit: bool = False) -> Tuple[bool, Optional[Any]]:
+        """Internal channel message send without retry spawning.
+
+        Args:
+            channel: The channel name (e.g., "LongFast").
+            content: The message content to send.
+            command_id: Optional command_id for repeat tracking.
+            skip_user_rate_limit: If True, skip the user rate limiter check.
+
+        Returns:
+            Tuple of (success, TransmissionRecord or None).
+        """
+        tx_record = None
+
         if not self.bot.connected or not self.bot.meshcore:
-            return False
-        
+            return False, None
+
         # Check all rate limits
         can_send, reason = await self._check_rate_limits(skip_user_rate_limit=skip_user_rate_limit)
         if not can_send:
             if reason:
                 self.logger.warning(reason)
-            return False
-        
+            return False, None
+
         try:
             # Get channel number from channel name
             channel_num = self.bot.channel_manager.get_channel_number(channel)
-            
+
             # Check if channel was found (None indicates channel name not found)
             if channel_num is None:
                 self.logger.error(f"Channel '{channel}' not found. Cannot send message.")
-                return False
-            
+                return False, None
+
             self.logger.info(f"Sending channel message to {channel} (channel {channel_num}): {content}")
-            
+
             # Record transmission for repeat tracking (don't let this block sending)
             try:
                 if hasattr(self.bot, 'transmission_tracker') and self.bot.transmission_tracker:
                     if not command_id:
                         command_id = f"channel_{channel}_{int(time.time())}"
-                    self.bot.transmission_tracker.record_transmission(
+                    tx_record = self.bot.transmission_tracker.record_transmission(
                         content=content,
                         target=channel,
                         message_type='channel',
@@ -726,18 +762,98 @@ class CommandManager:
             except Exception as e:
                 self.logger.debug(f"Error recording transmission for repeat tracking: {e}")
                 # Don't fail the send if transmission tracking fails
-            
+
             # Use meshcore-cli send_chan_msg function
             from meshcore_cli.meshcore_cli import send_chan_msg
             result = await send_chan_msg(self.bot.meshcore, channel_num, content)
-            
+
             # Handle result using unified handler
             target = f"{channel} (channel {channel_num})"
-            return self._handle_send_result(result, "Channel message", target)
-                
+            success = self._handle_send_result(result, "Channel message", target)
+            return success, tx_record
+
         except Exception as e:
             self.logger.error(f"Failed to send channel message: {e}")
-            return False
+            return False, tx_record
+
+    async def _check_channel_echo_and_retry(
+        self,
+        channel: str,
+        content: str,
+        command_id: Optional[str],
+        tx_record: Any,
+        attempt: int
+    ) -> None:
+        """Background task to verify channel message was echoed by a repeater.
+
+        Waits for the configured echo window, then checks if the TransmissionRecord
+        has been echoed. If not, retries the send up to max_attempts times.
+
+        Args:
+            channel: Channel name for retry send.
+            content: Message content for retry send.
+            command_id: Original command_id (retry will generate a new one).
+            tx_record: The TransmissionRecord from the original send.
+            attempt: Current retry attempt number (0-based).
+        """
+        try:
+            # Wait for the echo window
+            await asyncio.sleep(self.channel_retry_echo_window)
+
+            # Check if we've been disconnected while waiting
+            if not self.bot.connected or not self.bot.meshcore:
+                self.logger.debug("Channel retry: bot disconnected, skipping retry check")
+                return
+
+            # Check if repeater echo was detected
+            tracker = getattr(self.bot, 'transmission_tracker', None)
+            if tracker and tracker.has_repeater_echo(tx_record):
+                self.logger.debug(
+                    f"Channel retry: echo confirmed for '{content[:30]}' on {channel} "
+                    f"({tx_record.repeat_count} repeat(s) from {len(tx_record.repeater_prefixes)} repeater(s))"
+                )
+                return  # Message was echoed, no retry needed
+
+            # No echo detected -- check if we've exhausted retries
+            if attempt >= self.channel_retry_max_attempts:
+                self.logger.warning(
+                    f"Channel retry: no echo after {attempt + 1} attempt(s) for '{content[:50]}' "
+                    f"on {channel}. Max retries ({self.channel_retry_max_attempts}) reached."
+                )
+                return
+
+            # Retry the send
+            retry_num = attempt + 1
+            self.logger.info(
+                f"Channel retry: no echo detected for '{content[:50]}' on {channel}. "
+                f"Retrying (attempt {retry_num}/{self.channel_retry_max_attempts})..."
+            )
+
+            # Send the retry via internal method (no recursive retry spawning)
+            success, new_record = await self._send_channel_message_internal(
+                channel, content, command_id=None, skip_user_rate_limit=True
+            )
+
+            if success:
+                self.logger.info(
+                    f"Channel retry: attempt {retry_num} sent successfully for '{content[:50]}' on {channel}"
+                )
+                # If we got a record and have retries left, schedule another echo check
+                if new_record and retry_num < self.channel_retry_max_attempts:
+                    asyncio.create_task(
+                        self._check_channel_echo_and_retry(
+                            channel, content, command_id, new_record, attempt=retry_num
+                        )
+                    )
+            else:
+                self.logger.warning(
+                    f"Channel retry: attempt {retry_num} FAILED for '{content[:50]}' on {channel}"
+                )
+
+        except asyncio.CancelledError:
+            self.logger.debug("Channel retry task cancelled")
+        except Exception as e:
+            self.logger.error(f"Channel retry: error in echo check: {e}", exc_info=True)
     
     def get_help_for_command(self, command_name: str, message: MeshMessage = None) -> str:
         """Get help text for a specific command (LoRa-friendly compact format).
