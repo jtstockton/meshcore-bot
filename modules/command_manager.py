@@ -17,6 +17,7 @@ from .models import MeshMessage
 from .plugin_loader import PluginLoader
 from .commands.base_command import BaseCommand
 from .utils import check_internet_connectivity_async, decode_escape_sequences, format_keyword_response_with_placeholders
+from .config_validation import strip_optional_quotes
 
 
 @dataclass
@@ -83,6 +84,7 @@ class CommandManager:
         self.custom_syntax = self.load_custom_syntax()
         self.banned_users = self.load_banned_users()
         self.monitor_channels = self.load_monitor_channels()
+        self.channel_keywords = self.load_channel_keywords()
         self.command_prefix = self.load_command_prefix()
         
         # Initialize plugin loader and load all plugins
@@ -258,7 +260,13 @@ class CommandManager:
             self.logger.debug(f"Applying {self.bot.tx_delay_ms}ms transmission delay")
             await asyncio.sleep(self.bot.tx_delay_ms / 1000.0)
     
-    async def _check_rate_limits(self, skip_user_rate_limit: bool = False) -> Tuple[bool, str]:
+    def get_rate_limit_key(self, message: MeshMessage) -> Optional[str]:
+        """Return the key used for per-user rate limiting (pubkey when available, else sender name)."""
+        return message.sender_pubkey or message.sender_id or None
+    
+    async def _check_rate_limits(
+        self, skip_user_rate_limit: bool = False, rate_limit_key: Optional[str] = None
+    ) -> Tuple[bool, str]:
         """Check all rate limits before sending.
         
         Checks both the user-specific rate limits and the global bot transmission
@@ -266,21 +274,28 @@ class CommandManager:
         
         Args:
             skip_user_rate_limit: If True, skip the user rate limiter check (for automated responses).
+            rate_limit_key: Optional key for per-user rate limit (e.g. from get_rate_limit_key(message)).
         
         Returns:
             Tuple[bool, str]: A tuple containing:
                 - can_send: True if the message can be sent, False otherwise.
                 - reason: Reason string if rate limited, empty string otherwise.
         """
-        # Check user rate limiter (unless skipped for automated responses)
+        # Check global user rate limiter (unless skipped for automated responses)
         if not skip_user_rate_limit:
             if not self.bot.rate_limiter.can_send():
                 wait_time = self.bot.rate_limiter.time_until_next()
-                # Only log warning if there's a meaningful wait time (> 0.1 seconds)
-                # This avoids misleading "Wait 0.0 seconds" messages from timing edge cases
                 if wait_time > 0.1:
                     return False, f"Rate limited. Wait {wait_time:.1f} seconds"
-                return False, ""  # Still rate limited, just don't log for very short waits
+                return False, ""
+            # Per-user rate limit when enabled and key present
+            if getattr(self.bot, 'per_user_rate_limit_enabled', False) and rate_limit_key:
+                per_user = getattr(self.bot, 'per_user_rate_limiter', None)
+                if per_user and not per_user.can_send(rate_limit_key):
+                    wait_time = per_user.time_until_next(rate_limit_key)
+                    if wait_time > 0.1:
+                        return False, f"Rate limited. Wait {wait_time:.1f} seconds"
+                    return False, ""
         
         # Wait for bot TX rate limiter
         await self.bot.bot_tx_rate_limiter.wait_for_tx()
@@ -290,7 +305,14 @@ class CommandManager:
         
         return True, ""
     
-    def _handle_send_result(self, result, operation_name: str, target: str, used_retry_method: bool = False) -> bool:
+    def _handle_send_result(
+        self,
+        result,
+        operation_name: str,
+        target: str,
+        used_retry_method: bool = False,
+        rate_limit_key: Optional[str] = None,
+    ) -> bool:
         """Handle result from message send operations.
         
         Args:
@@ -298,6 +320,7 @@ class CommandManager:
             operation_name: Name of the operation ("DM" or "Channel message").
             target: Recipient name or channel name for logging.
             used_retry_method: True if send_msg_with_retry was used (affects logging).
+            rate_limit_key: Optional key for per-user rate limit recording.
         
         Returns:
             bool: True if send succeeded (ACK received or sent successfully), False otherwise.
@@ -322,6 +345,10 @@ class CommandManager:
                     self.logger.info(f"✅ {operation_name} sent to {target}")
                 self.bot.rate_limiter.record_send()
                 self.bot.bot_tx_rate_limiter.record_tx()
+                if getattr(self.bot, 'per_user_rate_limit_enabled', False) and rate_limit_key:
+                    per_user = getattr(self.bot, 'per_user_rate_limiter', None)
+                    if per_user:
+                        per_user.record_send(rate_limit_key)
                 return True
             
             # Handle unexpected event types
@@ -335,6 +362,10 @@ class CommandManager:
                     self.logger.warning(f"Channel message sent to {target} but confirmation event not received (message may have been sent)")
                     self.bot.rate_limiter.record_send()
                     self.bot.bot_tx_rate_limiter.record_tx()
+                    if getattr(self.bot, 'per_user_rate_limit_enabled', False) and rate_limit_key:
+                        per_user = getattr(self.bot, 'per_user_rate_limiter', None)
+                        if per_user:
+                            per_user.record_send(rate_limit_key)
                     return True
             
             # Unknown event type - log warning
@@ -345,6 +376,10 @@ class CommandManager:
         self.logger.info(f"✅ {operation_name} sent to {target} (result: {result})")
         self.bot.rate_limiter.record_send()
         self.bot.bot_tx_rate_limiter.record_tx()
+        if getattr(self.bot, 'per_user_rate_limit_enabled', False) and rate_limit_key:
+            per_user = getattr(self.bot, 'per_user_rate_limiter', None)
+            if per_user:
+                per_user.record_send(rate_limit_key)
         return True
     
     def load_keywords(self) -> Dict[str, str]:
@@ -379,6 +414,8 @@ class CommandManager:
     
     def load_banned_users(self) -> List[str]:
         """Load banned users from config"""
+        if not self.bot.config.has_section('Banned_Users'):
+            return []
         banned = self.bot.config.get('Banned_Users', 'banned_users', fallback='')
         return [user.strip() for user in banned.split(',') if user.strip()]
     
@@ -392,9 +429,33 @@ class CommandManager:
         return any(sender_id.startswith(entry) for entry in self.banned_users)
     
     def load_monitor_channels(self) -> List[str]:
-        """Load monitored channels from config"""
-        channels = self.bot.config.get('Channels', 'monitor_channels', fallback='')
+        """Load monitored channels from config.
+        Values may be quoted, e.g. \"#bot,#bot-everett,#bots\" or unquoted.
+        """
+        raw = self.bot.config.get('Channels', 'monitor_channels', fallback='')
+        channels = strip_optional_quotes(raw)
         return [channel.strip() for channel in channels.split(',') if channel.strip()]
+    
+    def load_channel_keywords(self) -> Optional[List[str]]:
+        """Load channel keyword whitelist from config.
+        
+        When set, only these triggers (command/keyword names) are answered in channels;
+        DMs always get all triggers. Use to reduce channel floods by making heavy
+        triggers DM-only. Names are case-insensitive.
+        """
+        raw = self.bot.config.get('Channels', 'channel_keywords', fallback='').strip()
+        if not raw:
+            return None
+        return [k.strip().lower() for k in raw.split(',') if k.strip()]
+    
+    def _is_channel_trigger_allowed(self, trigger: str, message: MeshMessage) -> bool:
+        """Return True if this trigger is allowed for the message context.
+        When channel_keywords is set, channel messages only allow listed triggers."""
+        if message.is_dm:
+            return True
+        if self.channel_keywords is None:
+            return True
+        return trigger.lower() in self.channel_keywords
     
     def load_command_prefix(self) -> str:
         """Load command prefix from config.
@@ -472,6 +533,9 @@ class CommandManager:
                     # For channel messages, check if channel is in monitor_channels
                     if message.channel not in self.monitor_channels:
                         break  # Channel not monitored, skip help keyword
+                    # When channel_keywords is set, only allow listed triggers in channel
+                    if not self._is_channel_trigger_allowed('help', message):
+                        break
                 
                 # Channel check passed, process help request
                 if content_lower.startswith(help_keyword + ' '):
@@ -482,7 +546,7 @@ class CommandManager:
                     matches.append(('help', help_text))
                     return matches
                 elif content_lower == help_keyword:
-                    help_text = self.get_general_help()
+                    help_text = self.get_general_help(message)
                     # Format the help response with message data (same as other keywords)
                     help_text = self.format_keyword_response(help_text, message)
                     matches.append(('help', help_text))
@@ -510,6 +574,10 @@ class CommandManager:
                         # Skip this command - don't add to matches
                         continue
                 
+                # When channel_keywords is set, only allow listed triggers in channel
+                if not self._is_channel_trigger_allowed(command_name, message):
+                    continue
+                
                 # Get response format and generate response
                 response_format = command.get_response_format()
                 if response_format:
@@ -535,6 +603,9 @@ class CommandManager:
                 # For channel messages, check if channel is in monitor_channels
                 if message.channel not in self.monitor_channels:
                     continue  # Channel not monitored, skip this keyword
+                # When channel_keywords is set, only allow listed triggers in channel
+                if not self._is_channel_trigger_allowed(keyword, message):
+                    continue
             
             keyword_lower = keyword.lower()
             
@@ -592,7 +663,14 @@ class CommandManager:
             if stats_command:
                 stats_command.record_command(message, 'advert', response_sent)
     
-    async def send_dm(self, recipient_id: str, content: str, command_id: Optional[str] = None, skip_user_rate_limit: bool = False) -> bool:
+    async def send_dm(
+        self,
+        recipient_id: str,
+        content: str,
+        command_id: Optional[str] = None,
+        skip_user_rate_limit: bool = False,
+        rate_limit_key: Optional[str] = None,
+    ) -> bool:
         """Send a direct message using meshcore-cli command.
         
         Handles contact lookup, rate limiting, and uses retry logic if available.
@@ -601,6 +679,8 @@ class CommandManager:
             recipient_id: The recipient's name or ID.
             content: The message content to send.
             command_id: Optional command_id for repeat tracking (if not provided, one will be generated).
+            skip_user_rate_limit: If True, skip user rate limiter checks (for automated responses).
+            rate_limit_key: Optional key for per-user rate limiting (e.g. from get_rate_limit_key(message)).
             
         Returns:
             bool: True if sent successfully, False otherwise.
@@ -609,7 +689,9 @@ class CommandManager:
             return False
         
         # Check all rate limits
-        can_send, reason = await self._check_rate_limits(skip_user_rate_limit=skip_user_rate_limit)
+        can_send, reason = await self._check_rate_limits(
+            skip_user_rate_limit=skip_user_rate_limit, rate_limit_key=rate_limit_key
+        )
         if not can_send:
             if reason:
                 self.logger.warning(reason)
@@ -677,13 +759,22 @@ class CommandManager:
                                hasattr(self.bot.meshcore.commands, 'send_msg_with_retry'))
             
             # Handle result using unified handler
-            return self._handle_send_result(result, "DM", contact_name, used_retry_method)
+            return self._handle_send_result(
+                result, "DM", contact_name, used_retry_method, rate_limit_key=rate_limit_key
+            )
                 
         except Exception as e:
             self.logger.error(f"Failed to send DM: {e}")
             return False
     
-    async def send_channel_message(self, channel: str, content: str, command_id: Optional[str] = None, skip_user_rate_limit: bool = False) -> bool:
+    async def send_channel_message(
+        self,
+        channel: str,
+        content: str,
+        command_id: Optional[str] = None,
+        skip_user_rate_limit: bool = False,
+        rate_limit_key: Optional[str] = None,
+    ) -> bool:
         """Send a channel message using meshcore-cli command.
 
         Resolves channel names to numbers and handles rate limiting.
@@ -694,13 +785,15 @@ class CommandManager:
             channel: The channel name (e.g., "LongFast").
             content: The message content to send.
             command_id: Optional command_id for repeat tracking (if not provided, one will be generated).
-            skip_user_rate_limit: If True, skip the user rate limiter check.
+            skip_user_rate_limit: If True, skip user rate limiter checks (for automated responses).
+            rate_limit_key: Optional key for per-user rate limiting (e.g. from get_rate_limit_key(message)).
+
 
         Returns:
             bool: True if sent successfully, False otherwise.
         """
         success, tx_record = await self._send_channel_message_internal(
-            channel, content, command_id, skip_user_rate_limit
+            channel, content, command_id, skip_user_rate_limit, rate_limit_key
         )
 
         # Spawn echo verification/retry if enabled and send succeeded
@@ -713,7 +806,7 @@ class CommandManager:
 
         return success
 
-    async def _send_channel_message_internal(self, channel: str, content: str, command_id: Optional[str] = None, skip_user_rate_limit: bool = False) -> Tuple[bool, Optional[Any]]:
+    async def _send_channel_message_internal(self, channel: str, content: str, command_id: Optional[str] = None, skip_user_rate_limit: bool = False, rate_limit_key: Optional[str] = None) -> Tuple[bool, Optional[Any]]:
         """Internal channel message send without retry spawning.
 
         Args:
@@ -721,6 +814,7 @@ class CommandManager:
             content: The message content to send.
             command_id: Optional command_id for repeat tracking.
             skip_user_rate_limit: If True, skip the user rate limiter check.
+            rate_limit_key: Optional key for per-user rate limiting.
 
         Returns:
             Tuple of (success, TransmissionRecord or None).
@@ -731,7 +825,9 @@ class CommandManager:
             return False, None
 
         # Check all rate limits
-        can_send, reason = await self._check_rate_limits(skip_user_rate_limit=skip_user_rate_limit)
+        can_send, reason = await self._check_rate_limits(
+            skip_user_rate_limit=skip_user_rate_limit, rate_limit_key=rate_limit_key
+        )
         if not can_send:
             if reason:
                 self.logger.warning(reason)
@@ -769,7 +865,9 @@ class CommandManager:
 
             # Handle result using unified handler
             target = f"{channel} (channel {channel_num})"
-            success = self._handle_send_result(result, "Channel message", target)
+            success = self._handle_send_result(
+                result, "Channel message", target, rate_limit_key=rate_limit_key
+            )
             return success, tx_record
 
         except Exception as e:
@@ -868,7 +966,7 @@ class CommandManager:
         # Special handling for common help requests
         if command_name.lower() in ['commands', 'list', 'all']:
             # User is asking for a list of commands, show general help
-            return self.get_general_help()
+            return self.get_general_help(message)
         
         # Map command aliases to their actual command names
         command_aliases = {
@@ -917,7 +1015,7 @@ class CommandManager:
         if 'help' in self.commands:
             help_command = self.commands['help']
             if hasattr(help_command, 'get_available_commands_list'):
-                available_str = help_command.get_available_commands_list()
+                available_str = help_command.get_available_commands_list(message)
         
         # Fallback if help command doesn't have the method
         if not available_str:
@@ -932,10 +1030,34 @@ class CommandManager:
             return self.bot.translator.translate('commands.help.unknown', command=command_name, available=available_str)
         return f"Unknown: {command_name}. Available: {available_str}. Try 'help' for command list."
     
-    def get_general_help(self) -> str:
-        """Get general help text from config (LoRa-friendly compact format)"""
-        # Get the help response from the keywords config
-        return self.keywords.get('help', 'Help not configured')
+    def get_general_help(self, message: MeshMessage = None) -> str:
+        """Get general help text from config (LoRa-friendly compact format).
+        
+        When message is provided, only lists commands valid for the message's channel.
+        """
+        # Prefer keywords config if user has customized help
+        if 'help' in self.keywords:
+            return self.keywords['help']
+        # Fallback: build compact list from available commands (filtered by channel)
+        if 'help' in self.commands:
+            help_command = self.commands['help']
+            if hasattr(help_command, 'get_available_commands_list'):
+                available_str = help_command.get_available_commands_list(message)
+                return f"Bot Help: {available_str} | More: 'help <command>'"
+        # Last resort: simple list of command names (filtered by channel when message provided)
+        help_cmd = self.commands.get('help')
+        if help_cmd and hasattr(help_cmd, '_is_command_valid_for_channel') and message:
+            primary_names = sorted([
+                cmd.name if hasattr(cmd, 'name') else name
+                for name, cmd in self.commands.items()
+                if help_cmd._is_command_valid_for_channel(name, cmd, message)
+            ])
+        else:
+            primary_names = sorted([
+                cmd.name if hasattr(cmd, 'name') else name
+                for name, cmd in self.commands.items()
+            ])
+        return f"Bot Help: {', '.join(primary_names)} | More: 'help <command>'"
     
     def get_available_commands_list(self) -> str:
         """Get a formatted list of available commands"""
@@ -1012,10 +1134,19 @@ class CommandManager:
             else:
                 self._last_response = content
             
+            rate_limit_key = self.get_rate_limit_key(message)
             if message.is_dm:
-                return await self.send_dm(message.sender_id, content, skip_user_rate_limit=skip_user_rate_limit)
+                return await self.send_dm(
+                    message.sender_id, content,
+                    skip_user_rate_limit=skip_user_rate_limit,
+                    rate_limit_key=rate_limit_key,
+                )
             else:
-                return await self.send_channel_message(message.channel, content, skip_user_rate_limit=skip_user_rate_limit)
+                return await self.send_channel_message(
+                    message.channel, content,
+                    skip_user_rate_limit=skip_user_rate_limit,
+                    rate_limit_key=rate_limit_key,
+                )
         except Exception as e:
             self.logger.error(f"Failed to send response: {e}")
             return False

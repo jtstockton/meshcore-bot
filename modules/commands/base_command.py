@@ -104,6 +104,33 @@ class BaseCommand(ABC):
             'Stats': 'Stats_Command',
             'Weather': 'Wx_Command',  # wx command reads from [Wx_Command]; [Weather] is legacy
         }
+        # Legacy [Jokes] -> [Joke_Command] / [DadJoke_Command]: (requested_section, key) -> legacy section
+        # For 'enabled', also try legacy key: (section, key) -> (legacy_section, legacy_key) or list of same
+        legacy_key_alias = {
+            ('Joke_Command', 'enabled'): ('Jokes', 'joke_enabled'),
+            ('DadJoke_Command', 'enabled'): ('Jokes', 'dadjoke_enabled'),
+            # Standard enabled with *_enabled fallback (same section, then old section)
+            ('Stats_Command', 'enabled'): [
+                ('Stats_Command', 'stats_enabled'),
+                ('Stats', 'stats_enabled'),
+            ],
+            ('Sports_Command', 'enabled'): [
+                ('Sports_Command', 'sports_enabled'),
+                ('Sports', 'sports_enabled'),
+            ],
+            ('Hacker_Command', 'enabled'): [
+                ('Hacker_Command', 'hacker_enabled'),
+                ('Hacker', 'hacker_enabled'),
+            ],
+            ('Alert_Command', 'enabled'): [('Alert_Command', 'alert_enabled')],
+        }
+        legacy_section_fallback = {
+            ('Joke_Command', 'joke_enabled'): 'Jokes',
+            ('Joke_Command', 'seasonal_jokes'): 'Jokes',
+            ('Joke_Command', 'long_jokes'): 'Jokes',
+            ('DadJoke_Command', 'dadjoke_enabled'): 'Jokes',
+            ('DadJoke_Command', 'long_jokes'): 'Jokes',
+        }
         
         # Determine old and new section names
         new_section = section
@@ -113,10 +140,13 @@ class BaseCommand(ABC):
                 old_section = old
                 break
         
-        # Try new section first, then old section for backward compatibility
+        # Try new section first, then old section for backward compatibility, then legacy (e.g. Jokes)
         sections_to_try = [new_section]
         if old_section:
             sections_to_try.append(old_section)
+        legacy_sec = legacy_section_fallback.get((section, key))
+        if legacy_sec and legacy_sec not in sections_to_try:
+            sections_to_try.append(legacy_sec)
         
         for sec in sections_to_try:
             if self.bot.config.has_section(sec):
@@ -144,9 +174,12 @@ class BaseCommand(ABC):
                     
                     # If we got a value (not fallback), return it
                     if value != fallback or self.bot.config.has_option(sec, key):
-                        # Log migration notice on first use of old section
+                        # Log migration notice on first use of old/legacy section
                         if sec == old_section:
                             self.logger.info(f"Config migration: Using old section '[{old_section}]' for '{key}'. "
+                                           f"Please update to '[{new_section}]' in config.ini")
+                        elif legacy_sec and sec == legacy_sec:
+                            self.logger.info(f"Config migration: Using old section '[{legacy_sec}]' for '{key}'. "
                                            f"Please update to '[{new_section}]' in config.ini")
                         return value
                 except (ValueError, TypeError) as e:
@@ -156,9 +189,30 @@ class BaseCommand(ABC):
                     self.logger.debug(f"Error reading config {sec}.{key}: {e}")
                     continue
         
+        # Try legacy key alias (e.g. [Jokes] joke_enabled when requesting Joke_Command enabled)
+        alias = legacy_key_alias.get((section, key))
+        if alias:
+            aliases = [alias] if isinstance(alias, tuple) else alias
+            for legacy_sec, legacy_key in aliases:
+                if self.bot.config.has_section(legacy_sec) and self.bot.config.has_option(legacy_sec, legacy_key):
+                    try:
+                        if value_type == 'bool':
+                            value = self.bot.config.getboolean(legacy_sec, legacy_key, fallback=fallback)
+                        elif value_type == 'int':
+                            value = self.bot.config.getint(legacy_sec, legacy_key, fallback=fallback)
+                        elif value_type == 'float':
+                            value = self.bot.config.getfloat(legacy_sec, legacy_key, fallback=fallback)
+                        elif value_type == 'list':
+                            raw = self.bot.config.get(legacy_sec, legacy_key)
+                            value = [item.strip() for item in raw.split(',') if item.strip()]
+                        else:
+                            value = self.bot.config.get(legacy_sec, legacy_key)
+                        return value
+                    except (ValueError, TypeError) as e:
+                        self.logger.debug(f"Config conversion error for {legacy_sec}.{legacy_key}: {e}")
+        
         return fallback
     
-    @abstractmethod
     @abstractmethod
     async def execute(self, message: MeshMessage) -> bool:
         """Execute the command with the given message.
@@ -246,6 +300,7 @@ class BaseCommand(ABC):
         # Special handling for camelCase names
         camel_case_map = {
             'dadjoke': 'DadJoke',
+            'webviewer': 'WebViewer',
         }
         
         if self.name in camel_case_map:
@@ -843,7 +898,7 @@ class BaseCommand(ABC):
     
     def requires_admin_access(self) -> bool:
         """Check if this command requires admin access"""
-        if not hasattr(self.bot, 'config'):
+        if not hasattr(self.bot, 'config') or not self.bot.config.has_section('Admin_ACL'):
             return False
         
         try:
@@ -871,7 +926,7 @@ class BaseCommand(ABC):
         - Uses centralized validate_pubkey_format() function
         """
         import re # This import is needed for re.match
-        if not hasattr(self.bot, 'config'):
+        if not hasattr(self.bot, 'config') or not self.bot.config.has_section('Admin_ACL'):
             return False
         
         try:

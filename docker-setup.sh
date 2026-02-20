@@ -36,17 +36,16 @@ update_config() {
 
     awk -v section="$section" -v key="$key" -v value="$value" '
         /^\[/ {
+            # Emit missing key at end of target section before we update state
+            leaving_target = (in_section && need_add)
             in_section = ($0 == "[" section "]")
             need_add = in_section
+            if (leaving_target) { print key " = " value }
         }
         in_section && $0 ~ "^" key "[[:space:]]*=" {
             print key " = " value
             need_add = 0
             next
-        }
-        need_add && in_section && $0 !~ /^\[/ {
-            print key " = " value
-            need_add = 0
         }
         { print }
         END {
@@ -95,7 +94,7 @@ else
 fi
 
 # [Web_Viewer] db_path is intentionally not set: when unset, the viewer uses [Bot] db_path.
-# See config.ini.example and docs/WEB_VIEWER.md.
+# See config.ini.example and docs/web-viewer.md.
 
 # Update PacketCapture paths (if section exists)
 if grep -q "^\[PacketCapture\]" "$CONFIG_FILE"; then

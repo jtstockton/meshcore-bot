@@ -23,6 +23,7 @@ try:
     from modules.plugin_loader import PluginLoader
     from modules.db_manager import DBManager
     from modules.utils import resolve_path
+    from modules.config_validation import strip_optional_quotes
 except ImportError as e:
     print("Error: Missing required dependencies.")
     print(f"Details: {e}")
@@ -933,6 +934,8 @@ def get_bot_name(config: configparser.ConfigParser) -> str:
 
 def get_admin_commands(config: configparser.ConfigParser) -> List[str]:
     """Extract admin commands from config"""
+    if not config.has_section('Admin_ACL'):
+        return []
     admin_commands_str = config.get('Admin_ACL', 'admin_commands', fallback='')
     if not admin_commands_str:
         return []
@@ -2447,8 +2450,8 @@ def generate_samples(config_file):
     title = get_website_title(config)
     introduction = get_website_intro(config)
 
-    # Get monitor channels
-    monitor_channels_str = config.get('Channels', 'monitor_channels', fallback='')
+    # Get monitor channels (quoted or unquoted)
+    monitor_channels_str = strip_optional_quotes(config.get('Channels', 'monitor_channels', fallback=''))
     monitor_channels = [ch.strip() for ch in monitor_channels_str.split(',') if ch.strip()]
 
     # Load channels from config
@@ -2676,8 +2679,8 @@ def main():
         introduction = get_website_intro(config)
         title = get_website_title(config)
         
-        # Get monitor channels for channel restriction display
-        monitor_channels_str = config.get('Channels', 'monitor_channels', fallback='')
+        # Get monitor channels for channel restriction display (quoted or unquoted)
+        monitor_channels_str = strip_optional_quotes(config.get('Channels', 'monitor_channels', fallback=''))
         monitor_channels = [ch.strip() for ch in monitor_channels_str.split(',') if ch.strip()]
         
         # Load channels from Channels_List section

@@ -27,7 +27,7 @@ from meshcore import EventType
 from meshcore_cli.meshcore_cli import send_cmd, send_chan_msg
 
 # Import our modules
-from .rate_limiter import RateLimiter, BotTxRateLimiter, NominatimRateLimiter
+from .rate_limiter import RateLimiter, BotTxRateLimiter, PerUserRateLimiter, NominatimRateLimiter
 from .message_handler import MessageHandler
 from .command_manager import CommandManager
 from .channel_manager import ChannelManager
@@ -96,7 +96,7 @@ class MeshCoreBot:
                 if wv_path != bot_path:
                     self.logger.warning(
                         "Web viewer database path differs from bot database: viewer=%s, bot=%s. "
-                        "For shared repeater/graph and packet stream data, set [Web_Viewer] db_path to the same as [Bot] db_path or remove it to use the bot database. See docs/WEB_VIEWER.md (migrating from a separate database).",
+                        "For shared repeater/graph and packet stream data, set [Web_Viewer] db_path to the same as [Bot] db_path or remove it to use the bot database. See docs/web-viewer.md (migrating from a separate database).",
                         wv_path, bot_path
                     )
         
@@ -118,6 +118,14 @@ class MeshCoreBot:
         self.bot_tx_rate_limiter = BotTxRateLimiter(
             self.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
         )
+        # Per-user rate limiter: minimum seconds between replies to the same user (key = pubkey or name)
+        self.per_user_rate_limit_enabled = self.config.getboolean(
+            'Bot', 'per_user_rate_limit_enabled', fallback=True
+        )
+        self.per_user_rate_limiter = PerUserRateLimiter(
+            seconds=self.config.getfloat('Bot', 'per_user_rate_limit_seconds', fallback=5.0),
+            max_entries=1000
+        )
         # Nominatim rate limiter: 1.1 seconds between requests (Nominatim policy: max 1 req/sec)
         self.nominatim_rate_limiter = NominatimRateLimiter(
             self.config.getfloat('Bot', 'nominatim_rate_limit_seconds', fallback=1.1)
@@ -127,8 +135,12 @@ class MeshCoreBot:
         # Initialize translator for localization BEFORE CommandManager
         # This ensures translated keywords are available when commands are loaded
         try:
-            language = self.config.get('Localization', 'language', fallback='en')
-            translation_path = self.config.get('Localization', 'translation_path', fallback='translations/')
+            if self.config.has_section('Localization'):
+                language = self.config.get('Localization', 'language', fallback='en')
+                translation_path = self.config.get('Localization', 'translation_path', fallback='translations/')
+            else:
+                language = 'en'
+                translation_path = 'translations/'
             self.translator = Translator(language, translation_path)
             self.logger.info(f"Localization initialized: {language}")
         except (OSError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
@@ -166,7 +178,7 @@ class MeshCoreBot:
         try:
             self.feed_manager = FeedManager(self)
             self.logger.info("Feed manager initialized successfully")
-        except (OSError, ValueError, AttributeError, ImportError) as e:
+        except (OSError, ValueError, AttributeError, ImportError, configparser.NoSectionError) as e:
             self.logger.warning(f"Failed to initialize feed manager: {e}")
             self.feed_manager = None
         
@@ -248,7 +260,8 @@ class MeshCoreBot:
         if not Path(self.config_file).exists():
             self.create_default_config()
         
-        self.config.read(self.config_file)
+        # Force UTF-8 so emoji and non-ASCII characters in config.ini parse on Windows.
+        self.config.read(self.config_file, encoding="utf-8")
     
     def _get_radio_settings(self) -> Dict[str, Any]:
         """Get current radio/connection settings from config.
@@ -286,7 +299,7 @@ class MeshCoreBot:
             if not Path(self.config_file).exists():
                 return (False, "Config file not found")
             
-            new_config.read(self.config_file)
+            new_config.read(self.config_file, encoding="utf-8")
             
             # Get new radio settings
             new_radio_settings = {
@@ -310,7 +323,7 @@ class MeshCoreBot:
             self.logger.info("Reloading configuration (radio settings unchanged)")
             
             # Reload the config
-            self.config.read(self.config_file)
+            self.config.read(self.config_file, encoding="utf-8")
             
             # Update rate limiters
             new_rate_limit = self.config.getint('Bot', 'rate_limit_seconds', fallback=10)
@@ -318,6 +331,12 @@ class MeshCoreBot:
             
             new_bot_tx_rate_limit = self.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
             self.bot_tx_rate_limiter = BotTxRateLimiter(new_bot_tx_rate_limit)
+            
+            self.per_user_rate_limit_enabled = self.config.getboolean(
+                'Bot', 'per_user_rate_limit_enabled', fallback=True
+            )
+            new_per_user_seconds = self.config.getfloat('Bot', 'per_user_rate_limit_seconds', fallback=5.0)
+            self.per_user_rate_limiter = PerUserRateLimiter(seconds=new_per_user_seconds, max_entries=1000)
             
             new_nominatim_rate_limit = self.config.getfloat('Bot', 'nominatim_rate_limit_seconds', fallback=1.1)
             self.nominatim_rate_limiter = NominatimRateLimiter(new_nominatim_rate_limit)
@@ -327,8 +346,12 @@ class MeshCoreBot:
             
             # Update translator if language changed
             try:
-                new_language = self.config.get('Localization', 'language', fallback='en')
-                new_translation_path = self.config.get('Localization', 'translation_path', fallback='translations/')
+                if self.config.has_section('Localization'):
+                    new_language = self.config.get('Localization', 'language', fallback='en')
+                    new_translation_path = self.config.get('Localization', 'translation_path', fallback='translations/')
+                else:
+                    new_language = 'en'
+                    new_translation_path = 'translations/'
                 if (not hasattr(self, 'translator') or 
                     getattr(self.translator, 'language', None) != new_language or
                     getattr(self.translator, 'translation_path', None) != new_translation_path):
@@ -352,6 +375,7 @@ class MeshCoreBot:
                 self.command_manager.custom_syntax = self.command_manager.load_custom_syntax()
                 self.command_manager.banned_users = self.command_manager.load_banned_users()
                 self.command_manager.monitor_channels = self.command_manager.load_monitor_channels()
+                self.command_manager.channel_keywords = self.command_manager.load_channel_keywords()
                 # Update channel retry settings
                 self.command_manager.channel_retry_enabled = self.config.getboolean('Bot', 'channel_retry_enabled', fallback=False)
                 self.command_manager.channel_retry_max_attempts = self.config.getint('Bot', 'channel_retry_max_attempts', fallback=1)
@@ -506,28 +530,6 @@ startup_advert = false
 # false: Manual mode - no automatic actions, use !repeater commands to manage contacts (default)
 auto_manage_contacts = false
 
-[Jokes]
-# Enable or disable the joke command
-# true: Joke command is available
-# false: Joke command is disabled
-joke_enabled = true
-
-# Enable seasonal joke defaults
-# When enabled, October defaults to spooky jokes, December defaults to Christmas jokes
-# true: Seasonal defaults are applied
-# false: No seasonal defaults (always random)
-seasonal_jokes = true
-
-# Enable or disable the dad joke command
-# true: Dad joke command is available
-# false: Dad joke command is disabled
-dadjoke_enabled = true
-
-# Handle long jokes (over 130 characters)
-# false: Fetch new jokes until we get a short one
-# true: Split long jokes into multiple messages
-long_jokes = false
-
 [Admin_ACL]
 # Admin Access Control List (ACL) for restricted commands
 # Only users with public keys listed here can execute admin commands
@@ -571,6 +573,12 @@ respond_to_dms = true
 # List of banned sender names (comma-separated). Matching is prefix (starts-with):
 # "Awful Username" also matches "Awful Username 🍆". No bot responses in channels or DMs.
 banned_users = 
+
+[Feed_Manager]
+# Enable or disable RSS/API feed subscriptions
+# true: Feed manager polls configured feeds and sends updates to channels
+# false: Feed manager disabled (default)
+feed_manager_enabled = false
 
 [Scheduled_Messages]
 # Scheduled message format: HHMM = channel:message
@@ -741,6 +749,30 @@ url_timeout = 10
 # true: Use 24-hour UTC format
 # false: Use 12-hour local format
 use_zulu_time = false
+
+[Joke_Command]
+# Enable or disable the joke command (true/false)
+enabled = true
+
+# Enable seasonal joke defaults (October: spooky, December: Christmas)
+# true: Seasonal defaults are applied (default)
+# false: No seasonal defaults (always random)
+seasonal_jokes = true
+
+# Handle long jokes (over 130 characters)
+# false: Fetch new jokes until we get a short one (default)
+# true: Split long jokes into multiple messages
+long_jokes = false
+
+[DadJoke_Command]
+# Enable or disable the dad joke command (true/false)
+enabled = true
+
+# Handle long jokes (over 130 characters)
+# false: Fetch new jokes until we get a short one (default)
+# true: Split long jokes into multiple messages
+long_jokes = false
+
 """
         with open(self.config_file, 'w') as f:
             f.write(default_config)
@@ -753,11 +785,21 @@ use_zulu_time = false
         Configures the logging system based on settings in the config file.
         Sets up console and file handlers, formatters, and log levels for
         both the bot and the underlying meshcore library.
+        If [Logging] section is missing, uses defaults (console/journal only, no file).
         """
-        log_level = getattr(logging, self.config.get('Logging', 'log_level', fallback='INFO'))
-        
+        if self.config.has_section('Logging'):
+            log_level = getattr(logging, self.config.get('Logging', 'log_level', fallback='INFO'))
+            colored_output = self.config.getboolean('Logging', 'colored_output', fallback=True)
+            log_file = self.config.get('Logging', 'log_file', fallback='meshcore_bot.log')
+            meshcore_log_level = getattr(logging, self.config.get('Logging', 'meshcore_log_level', fallback='INFO'))
+        else:
+            log_level = logging.INFO
+            colored_output = True
+            log_file = ''  # Console/journal only when no [Logging] section
+            meshcore_log_level = logging.INFO
+
         # Create formatter
-        if self.config.getboolean('Logging', 'colored_output', fallback=True):
+        if colored_output:
             formatter = colorlog.ColoredFormatter(
                 '%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                 datefmt='%Y-%m-%d %H:%M:%S',
@@ -788,8 +830,6 @@ use_zulu_time = false
         self.logger.addHandler(console_handler)
         
         # File handler
-        log_file = self.config.get('Logging', 'log_file', fallback='meshcore_bot.log')
-        
         # Strip whitespace and check if empty
         log_file = log_file.strip() if log_file else ''
         
@@ -821,8 +861,6 @@ use_zulu_time = false
         self.logger.propagate = False
         
         # Configure meshcore library logging (separate from bot logging)
-        meshcore_log_level = getattr(logging, self.config.get('Logging', 'meshcore_log_level', fallback='INFO'))
-        
         # Configure all possible meshcore-related loggers
         meshcore_loggers = [
             'meshcore',

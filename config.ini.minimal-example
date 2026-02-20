@@ -82,6 +82,11 @@ rate_limit_seconds = 10
 # Prevents bot from overwhelming the mesh network
 bot_tx_rate_limit_seconds = 1.0
 
+# Per-user rate limit: minimum seconds between bot replies to the same user
+# User key: public key when available, else sender name
+per_user_rate_limit_seconds = 5
+per_user_rate_limit_enabled = true
+
 # Transmission delay in milliseconds before sending messages
 # Helps prevent message collisions on the mesh network
 # Recommended: 100-500ms for busy networks, 0 for quiet networks
@@ -199,10 +204,18 @@ monitor_channels = general,test,emergency
 # false: Bot will ignore direct messages
 respond_to_dms = true
 
+# Optional: limit channel responses to certain keywords (e.g. help,ping,test).
+# When set, only these triggers work in channels; DMs get all triggers.
+# channel_keywords =
+
 [Banned_Users]
 # List of banned sender names (comma-separated). Matching is prefix (starts-with):
 # "Awful Username" also matches "Awful Username 🍆". No bot responses in channels or DMs.
 banned_users = 
+
+[Feed_Manager]
+# Enable or disable RSS/API feed subscriptions (disabled by default)
+feed_manager_enabled = false
 
 [Logging]
 # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -364,30 +377,27 @@ enabled = false
 # Enable or disable the cmd command
 enabled = false
 
-[Jokes]
-# Enable or disable joke commands
-joke_enabled = false
-dadjoke_enabled = false
+[Joke_Command]
+enabled = false
+
+[DadJoke_Command]
+enabled = false
 
 [Sports_Command]
-# Enable or disable the sports command
-sports_enabled = false
+enabled = false
 
 [Stats_Command]
-# Enable or disable the stats command
-stats_enabled = false
+enabled = false
 
 [Hacker_Command]
-# Enable or disable the hacker command
-hacker_enabled = false
+enabled = false
 
 [Greeter_Command]
 # Enable or disable the greeter command
 enabled = false
 
 [Alert_Command]
-# Enable or disable the alert command
-alert_enabled = false
+enabled = false
 
 [Announcements_Command]
 # Enable or disable the announcements command

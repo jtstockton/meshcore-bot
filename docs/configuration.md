@@ -6,7 +6,7 @@ The bot is configured via `config.ini` in the project root (or the path given wi
 
 - **Sections** are named in square brackets, e.g. `[Bot]`, `[Connection]`, `[Path_Command]`.
 - **Options** are `key = value` (or `key=value`). Comments start with `#` or `;`.
-- **Paths** can be relative (to the directory containing the config file) or absolute. For Docker, use absolute paths under `/data/` (see [Docker deployment](DOCKER.md)).
+- **Paths** can be relative (to the directory containing the config file) or absolute. For Docker, use absolute paths under `/data/` (see [Docker deployment](docker.md)).
 
 The main sections include:
 
@@ -14,11 +14,19 @@ The main sections include:
 |--------|---------|
 | `[Bot]` | Bot name, database path, response toggles, command prefix |
 | `[Connection]` | Serial, BLE, or TCP connection to the MeshCore device |
-| `[Channels]` | Channels to monitor, DM behavior |
+| `[Channels]` | Channels to monitor, DM behavior, optional channel keyword whitelist |
 | `[Admin_ACL]` | Admin public keys and admin-only commands |
 | `[Keywords]` | Keyword → response pairs |
 | `[Weather]` | Units and settings shared by `wx` / `gwx` and Weather Service |
 | `[Logging]` | Log file path and level |
+
+## Channels section
+
+`[Channels]` controls where the bot responds:
+
+- **`monitor_channels`** – Comma-separated channel names. The bot only responds to messages on these channels (and in DMs if enabled).
+- **`respond_to_dms`** – If `true`, the bot responds to direct messages; if `false`, it ignores DMs.
+- **`channel_keywords`** – Optional. When set (comma-separated command/keyword names), only those triggers are answered **in channels**; DMs always get all triggers. Use this to reduce channel traffic by making heavy triggers (e.g. `wx`, `satpass`, `joke`) DM-only. Leave empty or omit to allow all triggers in monitored channels. Per-command **`channels = `** (empty) in a command’s section also forces that command to be DM-only; see `config.ini.example` for examples (e.g. `[Joke_Command]`).
 
 ## Command and feature sections
 
@@ -37,9 +45,9 @@ Many commands and features have their own section. Options there control whether
 
 Examples of sections that configure specific commands or features:
 
-- **`[Path_Command]`** – Path decoding and repeater selection. See [Path Command](PATH_COMMAND_CONFIG.md) for all options.
+- **`[Path_Command]`** – Path decoding and repeater selection. See [Path Command](path-command-config.md) for all options.
 - **`[Prefix_Command]`** – Prefix lookup, prefix best, range limits.
-- **`[Weather]`** – Used by the `wx` / `gwx` commands and the Weather Service plugin (see [Weather Service](WEATHER_SERVICE.md)).
+- **`[Weather]`** – Used by the `wx` / `gwx` commands and the Weather Service plugin (see [Weather Service](weather-service.md)).
 - **`[Airplanes_Command]`** – Aircraft/ADS-B command (API URL, radius, limits).
 - **`[Aurora_Command]`** – Aurora command (default coordinates).
 - **`[Alert_Command]`** – Emergency alerts (agency IDs, etc.).
@@ -52,11 +60,15 @@ Full reference: see `config.ini.example` in the repository for every section and
 
 The Path command has many options (presets, proximity, graph validation, etc.). All are documented in:
 
-**[Path Command](PATH_COMMAND_CONFIG.md)** – Presets, geographic and graph settings, and tuning.
+**[Path Command](path-command-config.md)** – Presets, geographic and graph settings, and tuning.
 
 ## Service plugin configuration
 
 Service plugins (Discord Bridge, Packet Capture, Map Uploader, Weather Service) each have their own section and are documented under [Service Plugins](service-plugins.md).
+
+## Config validation
+
+Before starting the bot, you can validate section names and path writability. See [Config validation](config-validation.md) for how to run `validate_config.py` or `meshcore_bot.py --validate-config`, and what is checked (required sections, typos like `[WebViewer]` → `[Web_Viewer]`, and writable paths).
 
 ## Reloading configuration
 
