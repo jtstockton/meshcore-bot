@@ -15,7 +15,7 @@ services:
     # Device access for serial ports (Linux)
     # Uncomment and adjust if using serial connection
     devices:
-      - /dev/ttyACM0:/dev/ttyACM0
+      - /dev/ttyUSB0:/dev/ttyUSB0
     
     # Network mode for host access (needed for BLE and some serial setups)
     # Uncomment if you need host network access
