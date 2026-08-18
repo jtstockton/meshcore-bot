@@ -106,7 +106,7 @@ class MessageScheduler:
         # Stop and recreate the APScheduler to avoid duplicate jobs on reload
         self._shutdown_apscheduler_if_running()
         tz, _ = get_config_timezone(self.bot.config, self.logger)
-        self._apscheduler = BackgroundScheduler(timezone=tz)
+        self._apscheduler = BackgroundScheduler(timezone=tz, job_defaults={'misfire_grace_time': 60})
         self.scheduled_messages.clear()
 
         if self.bot.config.has_section('Scheduled_Messages'):
